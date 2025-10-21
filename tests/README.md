@@ -11,12 +11,27 @@ cd tests
 ./unit-test.sh
 ```
 
+### Simulation Test
+Visual demonstration of batch logic without Docker (runs anywhere):
+```bash
+cd tests
+./test-simulation.sh
+```
+
+This simulation walks through different batch-size scenarios step-by-step,
+showing exactly how containers are scaled, health-checked, and removed.
+Perfect for understanding the batch logic without needing Docker.
+
 ### Integration Tests
 Full end-to-end tests with Docker Compose (requires Docker):
 ```bash
 cd tests
 ./test.sh
 ```
+
+**Note:** Integration tests require Docker and Docker Compose to be installed
+and running. If Docker is not available, use the simulation test instead to
+see how the batch logic works.
 
 ## Prerequisites
 
