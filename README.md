@@ -58,6 +58,7 @@ Options:
 - `-p | --project-name NAME` - (not required) - Project name, as in `docker compose`.
 - `--profile NAME` - (not required) - Specify a profile to enable, as in `docker compose`.
 - `--pre-stop-hook CMD` - (not required) - Command to run in the old container before stopping it. Can be used for marking the container as unhealthy to make proxy stop sending requests to it, see [container draining](#draining-old-containers) below.
+- `-b | --batch-size N` - (not required) - Number of containers to update at a time during a rolling update. Default: 0 (update all containers at once)
 
 See [detailed options description](https://docker-rollout.wowu.dev/cli-options) and [compose.yml file examples](https://docker-rollout.wowu.dev/examples/) in docs.
 

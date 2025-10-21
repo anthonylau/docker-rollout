@@ -7,6 +7,7 @@ VERSION=v0.13
 HEALTHCHECK_TIMEOUT=60
 NO_HEALTHCHECK_TIMEOUT=10
 WAIT_AFTER_HEALTHY_DELAY=0
+BATCH_SIZE=0
 
 # Print metadata for Docker CLI plugin
 if [ "$1" = "docker-cli-plugin-metadata" ]; then
@@ -66,6 +67,7 @@ Options:
   -p, --project-name NAME     Specify an alternate project name
       --profile NAME          Specify an alternate profile to use
       --pre-stop-hook CMD     Run a command in the old container before stopping it.
+  -b, --batch-size N          Number of containers to update at a time (default: all containers)
   -v, --version               Print plugin version
 
 EOF
@@ -86,40 +88,24 @@ scale() {
   $COMPOSE_COMMAND $COMPOSE_FILES $ENV_FILES up --detach --scale "$1=$2" --no-recreate "$1"
 }
 
-main() {
-  # shellcheck disable=SC2086 # COMPOSE_FILES and ENV_FILES must be unquoted to allow multiple files
-  if [ -z "$($COMPOSE_COMMAND $COMPOSE_FILES $ENV_FILES ps --quiet "$SERVICE")" ]; then
-    echo "==> Service '$SERVICE' is not running. Starting the service."
-    $COMPOSE_COMMAND $COMPOSE_FILES $ENV_FILES up --detach --no-recreate "$SERVICE"
-    exit 0
-  fi
-
-  # shellcheck disable=SC2086 # COMPOSE_FILES and ENV_FILES must be unquoted to allow multiple files
-  OLD_CONTAINER_IDS_STRING=$($COMPOSE_COMMAND $COMPOSE_FILES $ENV_FILES ps --quiet "$SERVICE" | tr '\n' '|' | sed 's/|$//')
-  OLD_CONTAINER_IDS=$(echo "$OLD_CONTAINER_IDS_STRING" | tr '|' ' ')
-  SCALE=$(echo "$OLD_CONTAINER_IDS" | wc -w | tr -d ' ')
-  SCALE_TIMES_TWO=$((SCALE * 2))
-  echo "==> Scaling '$SERVICE' to '$SCALE_TIMES_TWO' instances"
-  scale "$SERVICE" $SCALE_TIMES_TWO
-
-  # Create a variable that contains the IDs of the new containers, but not the old ones
-  # shellcheck disable=SC2086 # COMPOSE_FILES and ENV_FILES must be unquoted to allow multiple files
-  NEW_CONTAINER_IDS=$($COMPOSE_COMMAND $COMPOSE_FILES $ENV_FILES ps --quiet "$SERVICE" | grep -Ev "$OLD_CONTAINER_IDS_STRING" | tr '\n' ' ')
+wait_for_health() {
+  CONTAINERS_TO_CHECK="$1"
+  EXPECTED_COUNT="$2"
 
   # Check if first container has healthcheck
   # shellcheck disable=SC2086 # DOCKER_ARGS must be unquoted to allow multiple arguments
-  if docker $DOCKER_ARGS inspect --format='{{json .State.Health}}' "$(echo $NEW_CONTAINER_IDS | cut -d\  -f 1)" | grep -q "Status"; then
+  if docker $DOCKER_ARGS inspect --format='{{json .State.Health}}' "$(echo $CONTAINERS_TO_CHECK | cut -d\  -f 1)" | grep -q "Status"; then
     echo "==> Waiting for new containers to be healthy (timeout: $HEALTHCHECK_TIMEOUT seconds)"
     for _ in $(seq 1 "$HEALTHCHECK_TIMEOUT"); do
       SUCCESS=0
 
-      for NEW_CONTAINER_ID in $NEW_CONTAINER_IDS; do
-        if healthcheck "$NEW_CONTAINER_ID"; then
+      for CONTAINER_ID in $CONTAINERS_TO_CHECK; do
+        if healthcheck "$CONTAINER_ID"; then
           SUCCESS=$((SUCCESS + 1))
         fi
       done
 
-      if [ "$SUCCESS" = "$SCALE" ]; then
+      if [ "$SUCCESS" = "$EXPECTED_COUNT" ]; then
         break
       fi
 
@@ -128,28 +114,30 @@ main() {
 
     SUCCESS=0
 
-    for NEW_CONTAINER_ID in $NEW_CONTAINER_IDS; do
-      if healthcheck "$NEW_CONTAINER_ID"; then
+    for CONTAINER_ID in $CONTAINERS_TO_CHECK; do
+      if healthcheck "$CONTAINER_ID"; then
         SUCCESS=$((SUCCESS + 1))
       fi
     done
 
-    if [ "$SUCCESS" != "$SCALE" ]; then
-      for NEW_CONTAINER_ID in $NEW_CONTAINER_IDS; do
-        echo "==> Health check status for container $NEW_CONTAINER_ID"
+    if [ "$SUCCESS" != "$EXPECTED_COUNT" ]; then
+      for CONTAINER_ID in $CONTAINERS_TO_CHECK; do
+        echo "==> Health check status for container $CONTAINER_ID"
 
         # shellcheck disable=SC2086 # DOCKER_ARGS must be unquoted to allow multiple arguments
-        docker $DOCKER_ARGS inspect --format='{{json .State.Health}}' "$NEW_CONTAINER_ID"
+        docker $DOCKER_ARGS inspect --format='{{json .State.Health}}' "$CONTAINER_ID"
 
-        echo "==> Logs for container $NEW_CONTAINER_ID"
+        echo "==> Logs for container $CONTAINER_ID"
         # shellcheck disable=SC2086 # DOCKER_ARGS must be unquoted to allow multiple arguments
-        docker $DOCKER_ARGS logs "$NEW_CONTAINER_ID"
+        docker $DOCKER_ARGS logs "$CONTAINER_ID"
       done
 
       echo "==> New containers are not healthy. Rolling back." >&2
 
-      docker $DOCKER_ARGS stop $NEW_CONTAINER_IDS
-      docker $DOCKER_ARGS rm $NEW_CONTAINER_IDS
+      # shellcheck disable=SC2086 # DOCKER_ARGS must be unquoted to allow multiple arguments
+      docker $DOCKER_ARGS stop $CONTAINERS_TO_CHECK
+      # shellcheck disable=SC2086 # DOCKER_ARGS must be unquoted to allow multiple arguments
+      docker $DOCKER_ARGS rm $CONTAINERS_TO_CHECK
 
       exit 1
     fi
@@ -162,30 +150,129 @@ main() {
     echo "==> Waiting for new containers to be ready ($NO_HEALTHCHECK_TIMEOUT seconds)"
     sleep "$NO_HEALTHCHECK_TIMEOUT"
   fi
+}
+
+run_pre_stop_hooks() {
+  CONTAINERS_FOR_HOOK="$1"
 
   # Check if pre-stop hook is defined in first old container label
-  FIRST_OLD_CONTAINER_ID=$(echo "$OLD_CONTAINER_IDS" | cut -d\  -f 1)
+  FIRST_CONTAINER_ID=$(echo "$CONTAINERS_FOR_HOOK" | cut -d\  -f 1)
   # shellcheck disable=SC2086 # DOCKER_ARGS must be unquoted to allow multiple arguments
-  PRE_STOP_HOOK=${PRE_STOP_HOOK:-$(docker $DOCKER_ARGS inspect --format='{{index .Config.Labels "docker-rollout.pre-stop-hook"}}' "$FIRST_OLD_CONTAINER_ID")}
+  HOOK=${PRE_STOP_HOOK:-$(docker $DOCKER_ARGS inspect --format='{{index .Config.Labels "docker-rollout.pre-stop-hook"}}' "$FIRST_CONTAINER_ID")}
 
-  if [ -n "$PRE_STOP_HOOK" ]; then
-    echo "==> Running pre-stop hook: $PRE_STOP_HOOK"
+  if [ -n "$HOOK" ]; then
+    echo "==> Running pre-stop hook: $HOOK"
 
-    for OLD_CONTAINER_ID in $OLD_CONTAINER_IDS; do
+    for CONTAINER_ID in $CONTAINERS_FOR_HOOK; do
       # shellcheck disable=SC2086 # DOCKER_ARGS must be unquoted to allow multiple arguments
-      docker $DOCKER_ARGS exec "$OLD_CONTAINER_ID" sh -c "$PRE_STOP_HOOK" &
+      docker $DOCKER_ARGS exec "$CONTAINER_ID" sh -c "$HOOK" &
     done
 
     # Wait for all pre-stop hooks to finish
     wait
   fi
+}
+
+stop_and_remove_containers() {
+  CONTAINERS_TO_REMOVE="$1"
 
   echo "==> Stopping and removing old containers"
 
-  # shellcheck disable=SC2086 # DOCKER_ARGS and OLD_CONTAINER_IDS must be unquoted to allow multiple arguments
-  docker $DOCKER_ARGS stop $OLD_CONTAINER_IDS
-  # shellcheck disable=SC2086 # DOCKER_ARGS and OLD_CONTAINER_IDS must be unquoted to allow multiple arguments
-  docker $DOCKER_ARGS rm $OLD_CONTAINER_IDS
+  # shellcheck disable=SC2086 # DOCKER_ARGS must be unquoted to allow multiple arguments
+  docker $DOCKER_ARGS stop $CONTAINERS_TO_REMOVE
+  # shellcheck disable=SC2086 # DOCKER_ARGS must be unquoted to allow multiple arguments
+  docker $DOCKER_ARGS rm $CONTAINERS_TO_REMOVE
+}
+
+main() {
+  # shellcheck disable=SC2086 # COMPOSE_FILES and ENV_FILES must be unquoted to allow multiple files
+  if [ -z "$($COMPOSE_COMMAND $COMPOSE_FILES $ENV_FILES ps --quiet "$SERVICE")" ]; then
+    echo "==> Service '$SERVICE' is not running. Starting the service."
+    $COMPOSE_COMMAND $COMPOSE_FILES $ENV_FILES up --detach --no-recreate "$SERVICE"
+    exit 0
+  fi
+
+  # shellcheck disable=SC2086 # COMPOSE_FILES and ENV_FILES must be unquoted to allow multiple files
+  OLD_CONTAINER_IDS_STRING=$($COMPOSE_COMMAND $COMPOSE_FILES $ENV_FILES ps --quiet "$SERVICE" | tr '\n' '|' | sed 's/|$//')
+  OLD_CONTAINER_IDS=$(echo "$OLD_CONTAINER_IDS_STRING" | tr '|' ' ')
+  SCALE=$(echo "$OLD_CONTAINER_IDS" | wc -w | tr -d ' ')
+
+  # If batch size is 0 or >= scale, update all at once (original behavior)
+  if [ "$BATCH_SIZE" -eq 0 ] || [ "$BATCH_SIZE" -ge "$SCALE" ]; then
+    SCALE_TIMES_TWO=$((SCALE * 2))
+    echo "==> Scaling '$SERVICE' to '$SCALE_TIMES_TWO' instances"
+    scale "$SERVICE" $SCALE_TIMES_TWO
+
+    # Create a variable that contains the IDs of the new containers, but not the old ones
+    # shellcheck disable=SC2086 # COMPOSE_FILES and ENV_FILES must be unquoted to allow multiple files
+    NEW_CONTAINER_IDS=$($COMPOSE_COMMAND $COMPOSE_FILES $ENV_FILES ps --quiet "$SERVICE" | grep -Ev "$OLD_CONTAINER_IDS_STRING" | tr '\n' ' ')
+
+    wait_for_health "$NEW_CONTAINER_IDS" "$SCALE"
+    run_pre_stop_hooks "$OLD_CONTAINER_IDS"
+    stop_and_remove_containers "$OLD_CONTAINER_IDS"
+  else
+    # Batch-based rolling update
+    echo "==> Performing rolling update with batch size: $BATCH_SIZE"
+    REMAINING_OLD_CONTAINERS="$OLD_CONTAINER_IDS"
+    CURRENT_SCALE=$SCALE
+
+    while [ -n "$REMAINING_OLD_CONTAINERS" ]; do
+      # Calculate batch size for this iteration
+      REMAINING_COUNT=$(echo "$REMAINING_OLD_CONTAINERS" | wc -w | tr -d ' ')
+      if [ "$REMAINING_COUNT" -le "$BATCH_SIZE" ]; then
+        CURRENT_BATCH_SIZE=$REMAINING_COUNT
+      else
+        CURRENT_BATCH_SIZE=$BATCH_SIZE
+      fi
+
+      echo "==> Scaling '$SERVICE' from '$CURRENT_SCALE' to '$((CURRENT_SCALE + CURRENT_BATCH_SIZE))' instances"
+      NEW_SCALE=$((CURRENT_SCALE + CURRENT_BATCH_SIZE))
+      scale "$SERVICE" $NEW_SCALE
+
+      # Get the newly created containers
+      # shellcheck disable=SC2086 # COMPOSE_FILES and ENV_FILES must be unquoted to allow multiple files
+      ALL_CONTAINER_IDS=$($COMPOSE_COMMAND $COMPOSE_FILES $ENV_FILES ps --quiet "$SERVICE" | tr '\n' ' ')
+      NEW_CONTAINER_IDS=""
+      for CONTAINER_ID in $ALL_CONTAINER_IDS; do
+        if ! echo "$OLD_CONTAINER_IDS_STRING" | grep -q "$CONTAINER_ID"; then
+          if ! echo "$NEW_CONTAINER_IDS" | grep -q "$CONTAINER_ID"; then
+            NEW_CONTAINER_IDS="$NEW_CONTAINER_IDS $CONTAINER_ID"
+          fi
+        fi
+      done
+      NEW_CONTAINER_IDS=$(echo "$NEW_CONTAINER_IDS" | sed 's/^ //')
+
+      wait_for_health "$NEW_CONTAINER_IDS" "$CURRENT_BATCH_SIZE"
+
+      # Get the batch of old containers to remove
+      BATCH_OLD_CONTAINERS=""
+      COUNT=0
+      for CONTAINER_ID in $REMAINING_OLD_CONTAINERS; do
+        if [ $COUNT -lt "$CURRENT_BATCH_SIZE" ]; then
+          BATCH_OLD_CONTAINERS="$BATCH_OLD_CONTAINERS $CONTAINER_ID"
+          COUNT=$((COUNT + 1))
+        fi
+      done
+      BATCH_OLD_CONTAINERS=$(echo "$BATCH_OLD_CONTAINERS" | sed 's/^ //')
+
+      run_pre_stop_hooks "$BATCH_OLD_CONTAINERS"
+      stop_and_remove_containers "$BATCH_OLD_CONTAINERS"
+
+      # Update remaining old containers
+      NEW_REMAINING=""
+      for CONTAINER_ID in $REMAINING_OLD_CONTAINERS; do
+        if ! echo "$BATCH_OLD_CONTAINERS" | grep -q "$CONTAINER_ID"; then
+          NEW_REMAINING="$NEW_REMAINING $CONTAINER_ID"
+        fi
+      done
+      REMAINING_OLD_CONTAINERS=$(echo "$NEW_REMAINING" | sed 's/^ //')
+
+      # Update the old container IDs string to exclude the removed ones
+      OLD_CONTAINER_IDS_STRING=$(echo "$OLD_CONTAINER_IDS_STRING" | sed "s/$(echo "$BATCH_OLD_CONTAINERS" | tr ' ' '|' | sed 's/|$//')//g" | sed 's/||*/|/g' | sed 's/^|//' | sed 's/|$//')
+    done
+
+    echo "==> Rolling update completed"
+  fi
 }
 
 while [ $# -gt 0 ]; do
@@ -224,6 +311,10 @@ while [ $# -gt 0 ]; do
     ;;
   --pre-stop-hook)
     PRE_STOP_HOOK="$2"
+    shift 2
+    ;;
+  -b | --batch-size)
+    BATCH_SIZE="$2"
     shift 2
     ;;
   -v | --version)

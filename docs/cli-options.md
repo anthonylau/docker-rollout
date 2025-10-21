@@ -141,3 +141,29 @@ docker rollout --pre-stop-hook "touch /tmp/drain && sleep 10" <service-name>
 {: .warning }
 This requires the service to have a healthcheck defined in `docker-compose.yml` or `Dockerfile` that will fail if `/tmp/drain` file exists.
 
+## `-b | --batch-size N`
+
+Number of containers to update at a time during a rolling update. This allows for more controlled deployments with less resource usage.
+
+Default: 0 (update all containers at once)
+
+**Example**
+
+For a service with 4 running containers, update 1 container at a time:
+
+```bash
+docker rollout --batch-size 1 <service-name>
+```
+
+This will:
+1. Spawn 1 new container (total: 5)
+2. Wait for the new container to be healthy
+3. Remove 1 old container (total: 4)
+4. Repeat steps 1-3 until all containers are updated
+
+**Use Cases**
+
+- **Limited Resources**: Update containers incrementally when you don't have enough resources to run 2x the number of containers
+- **Gradual Rollout**: Minimize the number of containers running the new version at any given time during the update
+- **Risk Mitigation**: Limit the blast radius by updating only a few containers at a time
+
